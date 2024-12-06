@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+aes = "0.8.4"
 base64 = "0.22.1"
 bytemuck = "1.20.0"
+cbc = "0.1.2"
+ecb = "0.1.2"
 hex = "0.4.3"
 pelite = "0.10.0"

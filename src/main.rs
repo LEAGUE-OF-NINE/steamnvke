@@ -3,11 +3,15 @@ mod steamnvke;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use aes::cipher::KeyInit;
+use aes::cipher::generic_array::GenericArray;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::block_padding::NoPadding;
 use pelite::pe64::{Pe, PeFile, Rva};
 use pelite::{Error, FileMap, Result};
-use pelite::Error::{Encoding, Null};
+use pelite::Error::{Encoding, Insanity, Null};
 use pelite::pe32::headers::SectionHeader;
 use ::steamnvke::{find_infix_windows, steam_xor};
 
@@ -153,7 +157,29 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<()>  {
                     &file_data[file_offset..file_offset + code_section.SizeOfRawData as usize]
                 );
 
-                println!("ok {}", BASE64_STANDARD.encode(code_section_data))
+                let mut original_iv = stub_header.aes_iv.clone();
+                let iv = original_iv.as_mut_slice();
+                type Aes256EcbDec = aes::Aes256;
+                let cipher = Aes256EcbDec::new(
+                    GenericArray::from_slice(&stub_header.aes_key),
+                );
+                cipher.decrypt_padded_mut::<NoPadding>(&mut *iv).unwrap();
+
+                type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+                let cipher = Aes256CbcDec::new(
+                    GenericArray::from_slice(&stub_header.aes_key),
+                    GenericArray::from_slice(&iv),
+                );
+
+                let plain_code_section = cipher.decrypt_padded_mut::<NoPadding>(code_section_data.as_mut_slice()).unwrap();
+
+                fs::OpenOptions::new()
+                    .create(true) // To create a new file
+                    .write(true)
+                    .open("code.decrypt")
+                    .map(|mut f| f.write(plain_code_section));
+
+                println!("ok {} {} {}", stub_header.code_section_stolen_data.len(), file_offset, plain_code_section.len());
             }
         }
     }
