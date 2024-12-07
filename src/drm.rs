@@ -1,23 +1,17 @@
-mod steamnvke;
 
-use std::fs;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use aes::cipher::KeyInit;
 use aes::cipher::generic_array::GenericArray;
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+use aes::cipher::KeyInit;
 use bytemuck::bytes_of;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::cipher::block_padding::NoPadding;
-use pelite::pe64::{Pe, PeFile, PeObject, Rva};
-use pelite::{Error, FileMap, Result};
-use pelite::Error::{Encoding, Insanity, Null};
-use pelite::image::{IMAGE_DATA_DIRECTORY, IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use pelite::image::{IMAGE_DATA_DIRECTORY, IMAGE_DOS_HEADER};
 use pelite::pe32::headers::SectionHeader;
 use pelite::pe64::image::IMAGE_NT_HEADERS;
-use pelite::util::AlignTo;
-use ::steamnvke::{find_infix_windows, steam_xor};
+use pelite::pe64::{Pe, PeFile};
+use pelite::Error::Encoding;
+use pelite::{Error, Result};
+use std::io::{Cursor, Seek, SeekFrom, Write};
+use crate::bytes::{find_infix_windows, steam_xor};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -75,7 +69,6 @@ struct WrappedImageDirectory(IMAGE_DATA_DIRECTORY);
 unsafe impl bytemuck::Pod for WrappedImageDirectory {}
 unsafe impl bytemuck::Zeroable for WrappedImageDirectory {}
 
-
 fn bind_section<'a>(file: &'a PeFile<'a>) -> Result<&'a [u8]> {
     for sect in file.section_headers() {
         let name: String = String::from_utf8_lossy(&sect.Name)
@@ -96,31 +89,27 @@ fn get_owner_section<'a>(file: &'a PeFile<'a>, rva: u32) -> Option<(usize, &'a S
         if size == 0 {
             size = sect.SizeOfRawData;
         }
-       if (rva >= sect.VirtualAddress) && (rva < sect.VirtualAddress + size) {
-           return Some((i, sect));
-       }
+        if (rva >= sect.VirtualAddress) && (rva < sect.VirtualAddress + size) {
+            return Some((i, sect));
+        }
     }
     None
 }
 
-fn check_is_variant31_x64(file: &PeFile) -> Result<()>  {
-    let bind = bind_section(&file)?;
+fn check_is_variant31_x64(file: &PeFile) -> Result<()> {
+    let bind = bind_section(file)?;
 
     println!("Checking known v3.x signature");
-    match find_infix_windows(bind, "E8 00 00 00 00 50 53 51 52 56 57 55 41 50") {
-        None => return Err(Error::Encoding),
-        Some(_) => {}
-    }
+    if find_infix_windows(bind, "E8 00 00 00 00 50 53 51 52 56 57 55 41 50").is_none() { return Err(Error::Encoding) }
 
     println!("Checking for offset");
-    let offset =
-        find_infix_windows(bind, "48 8D 91 ?? ?? ?? ?? 48")
-            .or(find_infix_windows(bind, "48 8D 91 ?? ?? ?? ?? 41"))
-            .or(find_infix_windows(bind, "48 C7 84 24 ?? ?? ?? ?? ?? ?? ?? ?? 48").map(|x| x+5))
-            .ok_or(Error::Encoding)?;
+    let offset = find_infix_windows(bind, "48 8D 91 ?? ?? ?? ?? 48")
+        .or(find_infix_windows(bind, "48 8D 91 ?? ?? ?? ?? 41"))
+        .or(find_infix_windows(bind, "48 C7 84 24 ?? ?? ?? ?? ?? ?? ?? ?? 48").map(|x| x + 5))
+        .ok_or(Error::Encoding)?;
 
     println!("Checking header size");
-    let header = &bind[offset+3..offset+7];
+    let header = &bind[offset + 3..offset + 7];
     let header = u32::from_le_bytes(header.try_into().unwrap());
     if header == 0xF0 {
         Ok(())
@@ -129,53 +118,22 @@ fn check_is_variant31_x64(file: &PeFile) -> Result<()>  {
     }
 }
 
-fn reconstruct_file(file: &PeFile) -> Vec<u8> {
-    let (sizeof_headers, sizeof_image, section_alignment) = {
-        let optional_header = file.optional_header();
-        (optional_header.SizeOfHeaders, optional_header.SizeOfImage, optional_header.SectionAlignment)
-    };
-
-    println!("Size of headers {}", sizeof_headers);
-
-    // Zero fill the underlying image
-    let mut vec = vec![0u8; sizeof_image as usize];
-
-    // Start by copying the headers
-    let image = file.image();
-    unsafe {
-        // Validated by constructor
-        let dest_headers = vec.get_unchecked_mut(..sizeof_headers as usize);
-        let src_headers = image.get_unchecked(..sizeof_headers as usize);
-        dest_headers.copy_from_slice(src_headers);
-    }
-
-    // Copy the section file data
-    for section in file.section_headers() {
-        let dest = vec.get_mut(section.VirtualAddress as usize..u32::wrapping_add(section.VirtualAddress, section.VirtualSize).align_to(section_alignment) as usize);
-        let src = image.get(section.PointerToRawData as usize..u32::wrapping_add(section.PointerToRawData, section.SizeOfRawData) as usize);
-        // Skip invalid sections...
-        if let (Some(dest), Some(src)) = (dest, src) {
-            dest[..src.len()].copy_from_slice(src);
-        }
-    }
-
-    vec
-}
-
-fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
+fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>> {
     let entry_point = file.nt_headers().OptionalHeader.AddressOfEntryPoint;
     let file_offset = file.rva_to_file_offset(entry_point)?;
     let offset = file_offset - 0xF0;
     let file_data_: &mut [u8] = &mut file_data.to_vec().clone();
-    let header_data = file_data_[offset..offset+0xF0].as_mut();
+    let header_data = file_data_[offset..offset + 0xF0].as_mut();
     let mut xor_key = steam_xor(header_data, 0xF0, 0);
     let stub_header: &SteamStub64Var31Header = bytemuck::from_bytes(header_data);
     if stub_header.signature != 0xC0DEC0DF {
         // Implement checking TLS callbacks
-        return Err(Encoding)
+        return Err(Encoding);
     }
 
-    let payload_addr = file.rva_to_file_offset(file.nt_headers().OptionalHeader.AddressOfEntryPoint - stub_header.bind_section_offset)?;
+    let payload_addr = file.rva_to_file_offset(
+        file.nt_headers().OptionalHeader.AddressOfEntryPoint - stub_header.bind_section_offset,
+    )?;
     let payload_size = (stub_header.payload_size + 0x0F) & 0xFFFFFFF0;
     if payload_size != 0 {
         let file_data: &mut [u8] = &mut file_data.to_vec().clone();
@@ -188,9 +146,15 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
 
     // Decrypt code data
     if stub_header.flags & 4 != 4 {
-        if let Some((code_section_index, code_section)) = get_owner_section(&file, stub_header.code_section_virtual_address as u32) {
+        if let Some((code_section_index, code_section)) =
+            get_owner_section(file, stub_header.code_section_virtual_address as u32)
+        {
             if code_section.SizeOfRawData > 0 {
-                let mut code_section_data = vec![0u8; code_section.SizeOfRawData as usize + stub_header.code_section_stolen_data.len()];
+                let mut code_section_data = vec![
+                    0u8;
+                    code_section.SizeOfRawData as usize
+                        + stub_header.code_section_stolen_data.len()
+                ];
 
                 // Copy the stolen data to the beginning of code_section_data
                 code_section_data[..stub_header.code_section_stolen_data.len()]
@@ -198,26 +162,26 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
 
                 // Copy the remaining code section data
                 let start_offset = stub_header.code_section_stolen_data.len();
-                let file_offset = file.rva_to_file_offset(code_section.VirtualAddress)? as usize;
+                let file_offset = file.rva_to_file_offset(code_section.VirtualAddress)?;
                 code_section_data[start_offset..].copy_from_slice(
-                    &file_data[file_offset..file_offset + code_section.SizeOfRawData as usize]
+                    &file_data[file_offset..file_offset + code_section.SizeOfRawData as usize],
                 );
 
-                let mut original_iv = stub_header.aes_iv.clone();
+                let mut original_iv = stub_header.aes_iv;
                 let iv = original_iv.as_mut_slice();
                 type Aes256EcbDec = aes::Aes256;
-                let cipher = Aes256EcbDec::new(
-                    GenericArray::from_slice(&stub_header.aes_key),
-                );
+                let cipher = Aes256EcbDec::new(GenericArray::from_slice(&stub_header.aes_key));
                 cipher.decrypt_padded_mut::<NoPadding>(&mut *iv).unwrap();
 
                 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
                 let cipher = Aes256CbcDec::new(
                     GenericArray::from_slice(&stub_header.aes_key),
-                    GenericArray::from_slice(&iv),
+                    GenericArray::from_slice(iv),
                 );
 
-                let plain_code_section = cipher.decrypt_padded_mut::<NoPadding>(code_section_data.as_mut_slice()).unwrap();
+                let plain_code_section = cipher
+                    .decrypt_padded_mut::<NoPadding>(code_section_data.as_mut_slice())
+                    .unwrap();
                 decrypted_code_section = Some((code_section_index, plain_code_section.to_vec()));
             }
         }
@@ -226,7 +190,7 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     let mut c: Cursor<Vec<u8>> = Cursor::new(Vec::new());
 
     // DOS Header
-    let dos_header = WrappedImageDosHeader { 0: *file.dos_header() };
+    let dos_header = WrappedImageDosHeader(*file.dos_header());
     let dos_header_bytes = bytes_of(&dos_header);
     c.write_all(dos_header_bytes).unwrap();
 
@@ -234,61 +198,48 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     if file.dos_header().e_lfanew > dos_header_bytes.len() as u32 {
         let dos_stub_size = file.dos_header().e_lfanew as usize - dos_header_bytes.len();
         let dos_stub: Vec<u8> = vec![0; dos_stub_size];
-        c.write_all(&*dos_stub).unwrap();
+        c.write_all(&dos_stub).unwrap();
     }
 
     // NT Header
     let mut nt_header = *file.nt_headers();
     nt_header.OptionalHeader.AddressOfEntryPoint = stub_header.original_entry_point as u32;
     nt_header.OptionalHeader.CheckSum = 0;
-    c.write_all(bytes_of(&WrappedImageNtHeader{ 0: nt_header })).unwrap();
+    c.write_all(bytes_of(&WrappedImageNtHeader(nt_header)))
+        .unwrap();
     for &dir in file.data_directory() {
-        c.write_all(bytes_of(&WrappedImageDirectory{ 0: dir })).unwrap()
+        c.write_all(bytes_of(&WrappedImageDirectory(dir)))
+            .unwrap()
     }
-
-    println!("Starting section at: {}", c.position());
 
     // Sections
     for (i, sect) in file.section_headers().iter().enumerate() {
         let sect_data = file.get_section_bytes(sect)?;
         c.write_all(dataview::bytes(sect)).unwrap();
-        println!("Section {} {}", sect.name().unwrap(), BASE64_STANDARD.encode(dataview::bytes(sect)));
         let sect_offset = c.position();
-        println!("Pos: {}", sect_offset);
         c.set_position(sect.PointerToRawData as u64);
         match decrypted_code_section {
-            Some((code_sect_index, ref code_data)) if i == code_sect_index => c.write_all(&code_data).unwrap(),
+            Some((code_sect_index, ref code_data)) if i == code_sect_index => {
+                c.write_all(code_data).unwrap()
+            }
             _ => c.write_all(sect_data).unwrap(),
         }
         c.set_position(sect_offset);
     }
 
-    // TODO: Overlay data
+    // Overlay data (Untested)
     c.seek(SeekFrom::End(0)).unwrap();
     let last_section = file.section_headers().iter().last().unwrap();
     let file_size = (last_section.SizeOfRawData + last_section.PointerToRawData) as usize;
     if file_size < file_data.len() {
-        println!("overlay deteced")
+        let overlay_data = &file_data[file_size..file_data.len()];
+        c.write_all(overlay_data).unwrap();
     }
 
     Ok(c.into_inner())
 }
 
-
-fn file_map<P: AsRef<Path> + ?Sized>(path: &P) -> Result<()> {
-    let path = path.as_ref();
-    if let Ok(map) = FileMap::open(path) {
-        let file = PeFile::from_bytes(&map)?;
-        reconstruct_file(&file);
-        check_is_variant31_x64(&file)?;
-        let new_file = strip_drm(&file, (&map).as_ref())?;
-        println!("Written {} bytes", new_file.len());
-        fs::write("unpacked.exe", new_file).unwrap();
-    }
-    Ok(())
-}
-
-fn main() {
-    let path = "/Users/octeep/Downloads/LimbusCompany.exe";
-    file_map(path).unwrap()
+pub fn strip_drm_from_exe(file: &[u8]) -> Result<Vec<u8>> {
+    let pe_file = PeFile::from_bytes(file)?;
+    strip_drm(&pe_file, file)
 }
