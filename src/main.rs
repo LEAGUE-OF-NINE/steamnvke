@@ -1,18 +1,21 @@
 mod steamnvke;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::Path;
 use aes::cipher::KeyInit;
 use aes::cipher::generic_array::GenericArray;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use bytemuck::bytes_of;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::cipher::block_padding::NoPadding;
 use pelite::pe64::{Pe, PeFile, Rva};
 use pelite::{Error, FileMap, Result};
 use pelite::Error::{Encoding, Insanity, Null};
+use pelite::image::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
 use pelite::pe32::headers::SectionHeader;
+use pelite::pe64::image::IMAGE_NT_HEADERS;
 use ::steamnvke::{find_infix_windows, steam_xor};
 
 #[repr(C)]
@@ -50,6 +53,21 @@ struct SteamStub64Var31Header {
 unsafe impl bytemuck::Pod for SteamStub64Var31Header {}
 unsafe impl bytemuck::Zeroable for SteamStub64Var31Header {}
 
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+struct WrappedImageDosHeader(IMAGE_DOS_HEADER);
+
+unsafe impl bytemuck::Pod for WrappedImageDosHeader {}
+unsafe impl bytemuck::Zeroable for WrappedImageDosHeader {}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+struct WrappedImageNtHeader(IMAGE_NT_HEADERS);
+
+unsafe impl bytemuck::Pod for WrappedImageNtHeader {}
+unsafe impl bytemuck::Zeroable for WrappedImageNtHeader {}
+
+
 fn bind_section<'a>(file: &'a PeFile<'a>) -> Result<&'a [u8]> {
     for sect in file.section_headers() {
         let name: String = String::from_utf8_lossy(&sect.Name)
@@ -64,33 +82,18 @@ fn bind_section<'a>(file: &'a PeFile<'a>) -> Result<&'a [u8]> {
     Err(Error::Null)
 }
 
-fn get_owner_section<'a>(file: &'a PeFile<'a>, rva: u32) -> Option<&'a SectionHeader> {
-    for sect in file.section_headers() {
+fn get_owner_section<'a>(file: &'a PeFile<'a>, rva: u32) -> Option<(usize, &'a SectionHeader)> {
+    for (i, sect) in file.section_headers().iter().enumerate() {
         let mut size = sect.VirtualSize;
         if size == 0 {
             size = sect.SizeOfRawData;
         }
        if (rva >= sect.VirtualAddress) && (rva < sect.VirtualAddress + size) {
-           return Some(sect);
+           return Some((i, sect));
        }
     }
     None
 }
-
-// public NativeApi64.ImageSectionHeader64 GetOwnerSection(ulong rva)
-// {
-// foreach (var s in this.Sections)
-// {
-// var size = s.VirtualSize;
-// if (size == 0)
-// size = s.SizeOfRawData;
-//
-// if ((rva >= s.VirtualAddress) && (rva < s.VirtualAddress + size))
-// return s;
-// }
-//
-// return default(NativeApi64.ImageSectionHeader64);
-// }
 
 fn check_is_variant31_x64(file: &PeFile) -> Result<()>  {
     let bind = bind_section(&file)?;
@@ -118,7 +121,7 @@ fn check_is_variant31_x64(file: &PeFile) -> Result<()>  {
     }
 }
 
-fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<()>  {
+fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     let entry_point = file.nt_headers().OptionalHeader.AddressOfEntryPoint;
     let file_offset = file.rva_to_file_offset(entry_point)?;
     let offset = file_offset - 0xF0;
@@ -131,7 +134,6 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<()>  {
         return Err(Encoding)
     }
 
-    // this.File.NtHeaders.OptionalHeader.AddressOfEntryPoint - this.StubHeader.BindSectionOffset
     let payload_addr = file.rva_to_file_offset(file.nt_headers().OptionalHeader.AddressOfEntryPoint - stub_header.bind_section_offset)?;
     let payload_size = (stub_header.payload_size + 0x0F) & 0xFFFFFFF0;
     if payload_size != 0 {
@@ -141,8 +143,11 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<()>  {
         xor_key = steam_xor(payload, payload_size, xor_key);
     }
 
+    let mut decrypted_code_section: Option<(usize, &[u8])> = None;
+
+    // Decrypt code data
     if stub_header.flags & 4 != 4 {
-        if let Some(code_section) = get_owner_section(&file, stub_header.code_section_virtual_address as u32) {
+        if let Some((code_section_index, code_section)) = get_owner_section(&file, stub_header.code_section_virtual_address as u32) {
             if code_section.SizeOfRawData > 0 {
                 let mut code_section_data = vec![0u8; code_section.SizeOfRawData as usize + stub_header.code_section_stolen_data.len()];
 
@@ -172,20 +177,34 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<()>  {
                 );
 
                 let plain_code_section = cipher.decrypt_padded_mut::<NoPadding>(code_section_data.as_mut_slice()).unwrap();
-
-                fs::OpenOptions::new()
-                    .create(true) // To create a new file
-                    .write(true)
-                    .open("code.decrypt")
-                    .map(|mut f| f.write(plain_code_section));
-
-                println!("ok {} {} {}", stub_header.code_section_stolen_data.len(), file_offset, plain_code_section.len());
+                decrypted_code_section = Some((code_section_index, plain_code_section));
             }
         }
     }
 
+    let mut c: Cursor<Vec<u8>> = Cursor::new(Vec::new());
 
-    Ok(())
+    // DOS Header
+    let dos_header = WrappedImageDosHeader { 0: *file.dos_header() };
+    let dos_header_bytes = bytes_of(&dos_header);
+    c.write_all(dos_header_bytes).unwrap();
+
+    // DOS Stub Data
+    if file.dos_header().e_lfanew > dos_header_bytes.len() as u32 {
+        let dos_stub_size = file.dos_header().e_lfanew as usize - dos_header_bytes.len();
+        let dos_stub: Vec<u8> = vec![0; dos_stub_size];
+        c.write_all(&*dos_stub).unwrap();
+    }
+
+    // NT Header
+    let mut nt_header = *file.nt_headers();
+    nt_header.OptionalHeader.AddressOfEntryPoint = stub_header.original_entry_point as u32;
+    nt_header.OptionalHeader.CheckSum = 0;
+    c.write_all(bytes_of(&WrappedImageNtHeader{ 0: nt_header })).unwrap();
+
+    // Sections
+
+    Ok(c.into_inner())
 }
 
 
@@ -194,7 +213,8 @@ fn file_map<P: AsRef<Path> + ?Sized>(path: &P) -> Result<()> {
     if let Ok(map) = FileMap::open(path) {
         let file = PeFile::from_bytes(&map)?;
         check_is_variant31_x64(&file)?;
-        strip_drm(&file, (&map).as_ref())?;
+        let new_file = strip_drm(&file, (&map).as_ref())?;
+        fs::write("unpacked.exe", new_file).unwrap();
     }
     Ok(())
 }

@@ -143,8 +143,7 @@ checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
 [[package]]
 name = "pelite"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88dccf4bd32294364aeb7bd55d749604450e9db54605887551f21baea7617685"
+source = "git+https://github.com/LEAGUE-OF-NINE/pelite#58214581a474ceb926f2fb1ef181f55639766fb4"
 dependencies = [
  "dataview",
  "libc",
@@ -156,8 +155,7 @@ dependencies = [
 [[package]]
 name = "pelite-macros"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a7cf3f8ecebb0f4895f4892a8be0a0dc81b498f9d56735cb769dc31bf00815b"
+source = "git+https://github.com/LEAGUE-OF-NINE/pelite#58214581a474ceb926f2fb1ef181f55639766fb4"
 
 [[package]]
 name = "steamnvke"
