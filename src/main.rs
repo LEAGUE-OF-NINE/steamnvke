@@ -1,7 +1,7 @@
 mod steamnvke;
 
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use aes::cipher::KeyInit;
 use aes::cipher::generic_array::GenericArray;
@@ -13,7 +13,7 @@ use cbc::cipher::block_padding::NoPadding;
 use pelite::pe64::{Pe, PeFile, PeObject, Rva};
 use pelite::{Error, FileMap, Result};
 use pelite::Error::{Encoding, Insanity, Null};
-use pelite::image::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
+use pelite::image::{IMAGE_DATA_DIRECTORY, IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
 use pelite::pe32::headers::SectionHeader;
 use pelite::pe64::image::IMAGE_NT_HEADERS;
 use pelite::util::AlignTo;
@@ -67,6 +67,13 @@ struct WrappedImageNtHeader(IMAGE_NT_HEADERS);
 
 unsafe impl bytemuck::Pod for WrappedImageNtHeader {}
 unsafe impl bytemuck::Zeroable for WrappedImageNtHeader {}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+struct WrappedImageDirectory(IMAGE_DATA_DIRECTORY);
+
+unsafe impl bytemuck::Pod for WrappedImageDirectory {}
+unsafe impl bytemuck::Zeroable for WrappedImageDirectory {}
 
 
 fn bind_section<'a>(file: &'a PeFile<'a>) -> Result<&'a [u8]> {
@@ -235,12 +242,19 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     nt_header.OptionalHeader.AddressOfEntryPoint = stub_header.original_entry_point as u32;
     nt_header.OptionalHeader.CheckSum = 0;
     c.write_all(bytes_of(&WrappedImageNtHeader{ 0: nt_header })).unwrap();
+    for &dir in file.data_directory() {
+        c.write_all(bytes_of(&WrappedImageDirectory{ 0: dir })).unwrap()
+    }
+
+    println!("Starting section at: {}", c.position());
 
     // Sections
     for (i, sect) in file.section_headers().iter().enumerate() {
         let sect_data = file.get_section_bytes(sect)?;
         c.write_all(dataview::bytes(sect)).unwrap();
+        println!("Section {} {}", sect.name().unwrap(), BASE64_STANDARD.encode(dataview::bytes(sect)));
         let sect_offset = c.position();
+        println!("Pos: {}", sect_offset);
         c.set_position(sect.PointerToRawData as u64);
         match decrypted_code_section {
             Some((code_sect_index, ref code_data)) if i == code_sect_index => c.write_all(&code_data).unwrap(),
@@ -250,6 +264,12 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     }
 
     // TODO: Overlay data
+    c.seek(SeekFrom::End(0)).unwrap();
+    let last_section = file.section_headers().iter().last().unwrap();
+    let file_size = (last_section.SizeOfRawData + last_section.PointerToRawData) as usize;
+    if file_size < file_data.len() {
+        println!("overlay deteced")
+    }
 
     Ok(c.into_inner())
 }
