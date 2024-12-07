@@ -96,7 +96,7 @@ fn get_owner_section<'a>(file: &'a PeFile<'a>, rva: u32) -> Option<(usize, &'a S
     None
 }
 
-fn check_is_variant31_x64(file: &PeFile) -> Result<()> {
+pub fn check_is_variant31_x64(file: &PeFile) -> Result<()> {
     let bind = bind_section(file)?;
 
     println!("Checking known v3.x signature");
@@ -124,7 +124,7 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>> {
     let offset = file_offset - 0xF0;
     let file_data_: &mut [u8] = &mut file_data.to_vec().clone();
     let header_data = file_data_[offset..offset + 0xF0].as_mut();
-    let mut xor_key = steam_xor(header_data, 0xF0, 0);
+    let xor_key = steam_xor(header_data, 0xF0, 0);
     let stub_header: &SteamStub64Var31Header = bytemuck::from_bytes(header_data);
     if stub_header.signature != 0xC0DEC0DF {
         // Implement checking TLS callbacks
@@ -139,7 +139,7 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>> {
         let file_data: &mut [u8] = &mut file_data.to_vec().clone();
         let payload_end = payload_addr + payload_size as usize;
         let payload = file_data[payload_addr..payload_end].as_mut();
-        xor_key = steam_xor(payload, payload_size, xor_key);
+        steam_xor(payload, payload_size, xor_key);
     }
 
     let mut decrypted_code_section: Option<(usize, Vec<u8>)> = None;
