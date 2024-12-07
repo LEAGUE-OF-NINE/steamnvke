@@ -10,12 +10,13 @@ use base64::prelude::BASE64_STANDARD;
 use bytemuck::bytes_of;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::cipher::block_padding::NoPadding;
-use pelite::pe64::{Pe, PeFile, Rva};
+use pelite::pe64::{Pe, PeFile, PeObject, Rva};
 use pelite::{Error, FileMap, Result};
 use pelite::Error::{Encoding, Insanity, Null};
 use pelite::image::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
 use pelite::pe32::headers::SectionHeader;
 use pelite::pe64::image::IMAGE_NT_HEADERS;
+use pelite::util::AlignTo;
 use ::steamnvke::{find_infix_windows, steam_xor};
 
 #[repr(C)]
@@ -121,6 +122,39 @@ fn check_is_variant31_x64(file: &PeFile) -> Result<()>  {
     }
 }
 
+fn reconstruct_file(file: &PeFile) -> Vec<u8> {
+    let (sizeof_headers, sizeof_image, section_alignment) = {
+        let optional_header = file.optional_header();
+        (optional_header.SizeOfHeaders, optional_header.SizeOfImage, optional_header.SectionAlignment)
+    };
+
+    println!("Size of headers {}", sizeof_headers);
+
+    // Zero fill the underlying image
+    let mut vec = vec![0u8; sizeof_image as usize];
+
+    // Start by copying the headers
+    let image = file.image();
+    unsafe {
+        // Validated by constructor
+        let dest_headers = vec.get_unchecked_mut(..sizeof_headers as usize);
+        let src_headers = image.get_unchecked(..sizeof_headers as usize);
+        dest_headers.copy_from_slice(src_headers);
+    }
+
+    // Copy the section file data
+    for section in file.section_headers() {
+        let dest = vec.get_mut(section.VirtualAddress as usize..u32::wrapping_add(section.VirtualAddress, section.VirtualSize).align_to(section_alignment) as usize);
+        let src = image.get(section.PointerToRawData as usize..u32::wrapping_add(section.PointerToRawData, section.SizeOfRawData) as usize);
+        // Skip invalid sections...
+        if let (Some(dest), Some(src)) = (dest, src) {
+            dest[..src.len()].copy_from_slice(src);
+        }
+    }
+
+    vec
+}
+
 fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     let entry_point = file.nt_headers().OptionalHeader.AddressOfEntryPoint;
     let file_offset = file.rva_to_file_offset(entry_point)?;
@@ -143,7 +177,7 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
         xor_key = steam_xor(payload, payload_size, xor_key);
     }
 
-    let mut decrypted_code_section: Option<(usize, &[u8])> = None;
+    let mut decrypted_code_section: Option<(usize, Vec<u8>)> = None;
 
     // Decrypt code data
     if stub_header.flags & 4 != 4 {
@@ -177,7 +211,7 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
                 );
 
                 let plain_code_section = cipher.decrypt_padded_mut::<NoPadding>(code_section_data.as_mut_slice()).unwrap();
-                decrypted_code_section = Some((code_section_index, plain_code_section));
+                decrypted_code_section = Some((code_section_index, plain_code_section.to_vec()));
             }
         }
     }
@@ -203,6 +237,19 @@ fn strip_drm(file: &PeFile, file_data: &[u8]) -> Result<Vec<u8>>  {
     c.write_all(bytes_of(&WrappedImageNtHeader{ 0: nt_header })).unwrap();
 
     // Sections
+    for (i, sect) in file.section_headers().iter().enumerate() {
+        let sect_data = file.get_section_bytes(sect)?;
+        c.write_all(dataview::bytes(sect)).unwrap();
+        let sect_offset = c.position();
+        c.set_position(sect.PointerToRawData as u64);
+        match decrypted_code_section {
+            Some((code_sect_index, ref code_data)) if i == code_sect_index => c.write_all(&code_data).unwrap(),
+            _ => c.write_all(sect_data).unwrap(),
+        }
+        c.set_position(sect_offset);
+    }
+
+    // TODO: Overlay data
 
     Ok(c.into_inner())
 }
@@ -212,8 +259,10 @@ fn file_map<P: AsRef<Path> + ?Sized>(path: &P) -> Result<()> {
     let path = path.as_ref();
     if let Ok(map) = FileMap::open(path) {
         let file = PeFile::from_bytes(&map)?;
+        reconstruct_file(&file);
         check_is_variant31_x64(&file)?;
         let new_file = strip_drm(&file, (&map).as_ref())?;
+        println!("Written {} bytes", new_file.len());
         fs::write("unpacked.exe", new_file).unwrap();
     }
     Ok(())
